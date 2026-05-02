@@ -119,6 +119,23 @@ async def start_thread(message: discord.Message) -> None:
         await send_chunked(message.channel, reply)
 
 
+async def reply_to_bot(message: discord.Message) -> None:
+    """ボットからのメンションに応答する（しりとり想定）。"""
+    prompt = extract_prompt(message)
+    mention = f"<@{message.author.id}>"
+    augmented = (
+        f"しりとりゲーム中。相手の言葉の末尾の文字から始まる言葉を1語答えて、"
+        f"{mention} をメンションして番を渡すこと。余計な説明は最小限に。\n"
+        f"相手: {prompt}"
+    )
+    session_id = conversations.get(message.channel.id)
+    async with message.channel.typing():
+        reply, new_sid = await call_claude(augmented, session_id)
+    if new_sid:
+        conversations[message.channel.id] = new_sid
+    await send_chunked(message.channel, reply)
+
+
 async def continue_thread(message: discord.Message) -> None:
     session_id = conversations.get(message.channel.id)
 
@@ -139,8 +156,16 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    # 自分自身は無視
+    if message.author == bot.user:
         return
+
+    # 他ボットはメンションがある場合のみ応答（ボットループ防止）
+    if message.author.bot:
+        if bot_is_mentioned(message):
+            await reply_to_bot(message)
+        return
+
     if not is_allowed_id(message.author.id):
         return
 
