@@ -79,22 +79,135 @@ async def run_subprocess(
     return stdout.decode().strip(), proc.returncode
 
 
-async def call_claude(prompt: str, session_id: str | None = None) -> tuple[str, str]:
-    """claude CLI を呼び出し (reply, new_session_id) を返す。OAuth を自動使用。"""
+TOOL_EMOJI = {
+    "get_position": "📍",
+    "get_status": "📡",
+    "arm": "🔒",
+    "disarm": "🔓",
+    "takeoff": "🚀",
+    "change_mode": "🔄",
+    "goto_location": "🗺️",
+    "upload_star_mission": "⭐",
+    "start_mission": "▶️",
+    "clear_mission": "🗑️",
+    "speak": "🗣️",
+    "notify": "📢",
+}
+
+
+async def call_claude(
+    prompt: str,
+    session_id: str | None = None,
+    progress_msg: discord.Message | None = None,
+) -> tuple[str, str]:
+    """claude CLI をストリーミング実行し (reply, new_session_id) を返す。
+    progress_msg が渡された場合、ツール呼び出しの都度そのメッセージを編集する。
+    """
     args = [
         "claude", "--dangerously-skip-permissions",
         "-p", prompt,
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--verbose",
     ]
     if session_id:
         args += ["--resume", session_id]
 
-    raw, code = await run_subprocess(args, cwd=REPO_ROOT, timeout=120)
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,  # stdout と分離して混入防止
+        cwd=REPO_ROOT,
+    )
+
+    steps: list[str] = []
+    out: list[str] = ["", ""]  # [result_text, new_session_id]
+    err_lines: list[str] = []
+
+    async def update_progress():
+        if not progress_msg:
+            return
+        body = "⏳ **実行中...**\n" + "\n".join(steps) if steps else "⏳ 考え中..."
+        try:
+            await progress_msg.edit(content=body[:1990])
+        except discord.HTTPException:
+            pass
+
+    async def process_stream():
+        async for raw_line in proc.stdout:
+            line = raw_line.decode().strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[stream non-json] {line[:200]}")
+                continue
+
+            etype = event.get("type")
+            print(f"[stream] type={etype}")  # デバッグ用
+
+            if etype == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use":
+                        name = block["name"]
+                        inp = json.dumps(block.get("input", {}), ensure_ascii=False)
+                        if len(inp) > 60:
+                            inp = inp[:60] + "…"
+                        emoji = TOOL_EMOJI.get(name, "🔧")
+                        steps.append(f"{emoji} `{name}` — {inp}")
+                        await update_progress()
+
+            elif etype == "result":
+                out[0] = event.get("result", "") or ""
+                out[1] = event.get("session_id", "")
+                print(f"[stream] result captured: {repr(out[0][:80])}")
+
+    async def collect_stderr():
+        async for raw_line in proc.stderr:
+            line = raw_line.decode().strip()
+            if line:
+                err_lines.append(line)
+                print(f"[stderr] {line[:200]}")
+
     try:
-        data = json.loads(raw)
-        return data["result"], data["session_id"]
-    except (json.JSONDecodeError, KeyError):
-        return raw or "(no response)", ""
+        await asyncio.wait_for(
+            asyncio.gather(process_stream(), collect_stderr()),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "Timeout after 120s", ""
+    except Exception as e:
+        proc.kill()
+        return f"エラー: {e}", ""
+    finally:
+        await proc.wait()
+
+    result_text, new_session_id = out[0], out[1]
+
+    # result が空でもツールを実行していれば完了とみなす
+    if not result_text:
+        if steps:
+            result_text = "完了しました。"
+        elif err_lines:
+            result_text = "エラー:\n" + "\n".join(err_lines[-5:])
+        else:
+            result_text = "(no response)"
+
+    if progress_msg:
+        if steps:
+            body = "✅ **完了**\n" + "\n".join(steps)
+            try:
+                await progress_msg.edit(content=body[:1990])
+            except discord.HTTPException:
+                pass
+        else:
+            try:
+                await progress_msg.delete()
+            except discord.HTTPException:
+                pass
+
+    return result_text, new_session_id
 
 
 async def start_thread(message: discord.Message) -> None:
@@ -107,14 +220,14 @@ async def start_thread(message: discord.Message) -> None:
         thread = await message.create_thread(
             name=prompt[:80], auto_archive_duration=60
         )
-        async with thread.typing():
-            reply, session_id = await call_claude(prompt)
+        progress_msg = await thread.send("⏳ 考え中...")
+        reply, session_id = await call_claude(prompt, progress_msg=progress_msg)
         conversations[thread.id] = session_id
         await send_chunked(thread, reply)
     else:
         # DM など、スレッド非対応チャンネルは直接返信
-        async with message.channel.typing():
-            reply, session_id = await call_claude(prompt)
+        progress_msg = await message.channel.send("⏳ 考え中...")
+        reply, session_id = await call_claude(prompt, progress_msg=progress_msg)
         conversations[message.channel.id] = session_id
         await send_chunked(message.channel, reply)
 
@@ -129,8 +242,7 @@ async def reply_to_bot(message: discord.Message) -> None:
         f"相手: {prompt}"
     )
     session_id = conversations.get(message.channel.id)
-    async with message.channel.typing():
-        reply, new_sid = await call_claude(augmented, session_id)
+    reply, new_sid = await call_claude(augmented, session_id)
     if new_sid:
         conversations[message.channel.id] = new_sid
     await send_chunked(message.channel, reply)
@@ -138,9 +250,8 @@ async def reply_to_bot(message: discord.Message) -> None:
 
 async def continue_thread(message: discord.Message) -> None:
     session_id = conversations.get(message.channel.id)
-
-    async with message.channel.typing():
-        reply, new_session_id = await call_claude(message.content, session_id)
+    progress_msg = await message.channel.send("⏳ 考え中...")
+    reply, new_session_id = await call_claude(message.content, session_id, progress_msg)
 
     # コンテキスト圧縮などで session_id が変わる場合があるので更新
     if new_session_id:
